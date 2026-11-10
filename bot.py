@@ -10,14 +10,14 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("SUPABASE_URL")
+DATABASE_URL = os.environ.get("SUPABASE_URL")   # ← اسم Secret تو
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 REQUIRED_CHANNEL = "@Wallet_BANI"
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN missing")
 if not DATABASE_URL:
-    raise SystemExit("DATABASE_URL missing")
+    raise SystemExit("SUPABASE_URL missing")
 
 logger.info(f"Bot starting... OWNER_ID={OWNER_ID}")
 
