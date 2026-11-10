@@ -10,7 +10,7 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("SUPABASE_URL")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 REQUIRED_CHANNEL = "@Wallet_BANI"
 
