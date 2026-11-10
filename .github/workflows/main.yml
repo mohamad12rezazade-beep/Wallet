@@ -1,24 +1,29 @@
 name: Run Telegram Bot
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # این خط باعث میشه دکمه اجرای دستی توی گیت‌هاب ظاهر بشه [citation:1][citation:14]
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 350  # حداکثر زمان اجرا (کمی کمتر از ۶ ساعت)
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - run: python bot.py
+      - name: Run bot
+        run: python bot.py
         env:
+          # اینجا اسم Secret ها باید دقیقاً با چیزی که تو ساختی یکی باشه
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           OWNER_ID: ${{ secrets.OWNER_ID }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}  # اسم Secret تو
