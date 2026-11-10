@@ -6,12 +6,20 @@ from psycopg2.extras import RealDictCursor, Json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 REQUIRED_CHANNEL = "@Wallet_BANI"
+
+if not BOT_TOKEN:
+    raise SystemExit("BOT_TOKEN missing")
+if not DATABASE_URL:
+    raise SystemExit("DATABASE_URL missing")
+
+logger.info(f"Bot starting... OWNER_ID={OWNER_ID}")
 
 CURRENCIES = {
     "ton":    {"name": "TON",    "wallet": "UQA9sAdUajvpJd7iIBSKuhppy34ZPXReecKGLHiwdna8qOi_", "min_dep": 0.03, "min_wd": 0.15, "wd_fee": 0.05, "min_cv": 0.07},
@@ -34,31 +42,33 @@ def query(sql, params=None, fetch=True):
                 return cur.fetchall()
             conn.commit()
             return None
+    except Exception as e:
+        logger.error(f"DB error: {e}")
+        raise
     finally:
         conn.close()
 
-def get_user(user_id):
-    r = query("select * from users where telegram_id=%s", (user_id,))
+def get_user(uid):
+    r = query("select * from users where telegram_id=%s", (uid,))
     return r[0] if r else None
 
-def ensure_user(user_id, username):
-    if not get_user(user_id):
-        query("insert into users (telegram_id, username) values (%s,%s)", (user_id, username), fetch=False)
+def ensure_user(uid, username):
+    if not get_user(uid):
+        query("insert into users (telegram_id, username) values (%s,%s) on conflict do nothing", (uid, username), fetch=False)
 
-def get_state(user_id):
-    r = query("select * from user_states where telegram_id=%s", (user_id,))
+def get_state(uid):
+    r = query("select * from user_states where telegram_id=%s", (uid,))
     return r[0] if r else None
 
-def set_state(user_id, state, data=None):
+def set_state(uid, state, data=None):
     query("""
         insert into user_states (telegram_id, state, data) values (%s,%s,%s)
         on conflict (telegram_id) do update set state=excluded.state, data=excluded.data
-    """, (user_id, state, Json(data or {})), fetch=False)
+    """, (uid, state, Json(data or {})), fetch=False)
 
-def clear_state(user_id):
-    query("delete from user_states where telegram_id=%s", (user_id,), fetch=False)
+def clear_state(uid):
+    query("delete from user_states where telegram_id=%s", (uid,), fetch=False)
 
-# ============ منوها ============
 main_menu = InlineKeyboardMarkup([
     [InlineKeyboardButton("👛 کیف پول", callback_data="wallet")],
     [InlineKeyboardButton("🎁 ایردراپ", callback_data="airdrop")],
@@ -114,18 +124,28 @@ convert_to_menu = InlineKeyboardMarkup([
 def fmt_mention(u):
     return f"[{u.first_name or u.username or u.id}](tg://user?id={u.id})"
 
-async def is_member(context, user_id):
+async def is_member(context, uid):
     try:
-        m = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
+        m = await context.bot.get_chat_member(REQUIRED_CHANNEL, uid)
         return m.status in ["member", "administrator", "creator"]
-    except:
+    except Exception as e:
+        logger.warning(f"is_member error: {e}")
         return False
 
-# ============ هندلرها ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    ensure_user(user.id, user.username or "")
-    if not await is_member(context, user.id):
+    logger.info(f"/start from {user.id}")
+    try:
+        ensure_user(user.id, user.username or "")
+    except Exception as e:
+        logger.error(f"ensure_user: {e}")
+
+    try:
+        member = await is_member(context, user.id)
+    except:
+        member = False
+
+    if not member:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📢 عضویت در کانال", url=f"https://t.me/{REQUIRED_CHANNEL[1:]}")],
             [InlineKeyboardButton("✅ عضو شدم", callback_data="check_member")],
@@ -135,17 +155,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
         )
         return
+
     clear_state(user.id)
     await update.message.reply_text("👋 خوش آمدید!\nاز منوی زیر انتخاب کنید:", reply_markup=main_menu)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    user_id = q.from_user.id
+    uid = q.from_user.id
     data = q.data
+    logger.info(f"callback {data} from {uid}")
 
     if data == "check_member":
-        if await is_member(context, user_id):
+        if await is_member(context, uid):
             await q.edit_message_text("✅ عضویت تایید شد!", reply_markup=main_menu)
         else:
             await q.answer("هنوز عضو نشدی!", show_alert=True)
@@ -164,7 +186,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"💱 ارزها:\n\n{txt}", reply_markup=main_menu); return
 
     if data == "balances":
-        u = get_user(user_id)
+        u = get_user(uid)
         text = (
             f"📊 موجودی‌ها:\n\n"
             f"💎 TON: {u.get('balance_ton', 0)}\n"
@@ -177,53 +199,45 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=wallet_menu); return
 
     if data == "deposit":
-        await q.edit_message_text("📥 ارز مورد نظر برای واریز:", reply_markup=deposit_menu); return
+        await q.edit_message_text("📥 ارز مورد نظر:", reply_markup=deposit_menu); return
 
     if data.startswith("dep_"):
         cur = data[4:]; c = CURRENCIES[cur]
-        set_state(user_id, "await_deposit_amount", {"currency": cur})
-        if cur == "stars":
-            await q.edit_message_text(
-                f"⭐ واریز STARS\n\nلطفاً به آیدی {c['wallet']} گیفت استارز بزن و تعداد را وارد کن:",
-                reply_markup=wallet_menu)
-        else:
-            await q.edit_message_text(
-                f"📥 واریز {c['name']}\n\n👛 ولت: `{c['wallet']}`\n📉 حداقل: {c['min_dep']}\n\nمقدار را وارد کن:",
-                reply_markup=wallet_menu, parse_mode="Markdown")
+        set_state(uid, "await_deposit_amount", {"currency": cur})
+        await q.edit_message_text(
+            f"📥 واریز {c['name']}\n\n👛 ولت: `{c['wallet']}`\n📉 حداقل: {c['min_dep']}\n\nمقدار را وارد کن:",
+            reply_markup=wallet_menu, parse_mode="Markdown")
         return
 
     if data == "withdraw":
-        await q.edit_message_text("📤 ارز مورد نظر برای برداشت:", reply_markup=withdraw_menu); return
+        await q.edit_message_text("📤 ارز مورد نظر:", reply_markup=withdraw_menu); return
 
     if data.startswith("wd_"):
         cur = data[3:]; c = CURRENCIES[cur]
-        set_state(user_id, "await_withdraw_amount", {"currency": cur})
+        set_state(uid, "await_withdraw_amount", {"currency": cur})
         await q.edit_message_text(
             f"📤 برداشت {c['name']}\n\n📉 حداقل: {c['min_wd']}\n💸 کارمزد: {c['wd_fee']}\n\nمقدار را وارد کن:",
             reply_markup=wallet_menu)
         return
 
     if data == "convert":
-        await q.edit_message_text("🔄 از کدام ارز تبدیل می‌کنی؟", reply_markup=convert_from_menu); return
+        await q.edit_message_text("🔄 از کدام ارز؟", reply_markup=convert_from_menu); return
 
     if data.startswith("cv_"):
         frm = data[3:]
-        set_state(user_id, "await_convert_to", {"from": frm})
-        await q.edit_message_text(
-            f"از {CURRENCIES[frm]['name']} — ارز مقصد را انتخاب کن:",
-            reply_markup=convert_to_menu)
+        set_state(uid, "await_convert_to", {"from": frm})
+        await q.edit_message_text(f"از {CURRENCIES[frm]['name']} — به کدام؟", reply_markup=convert_to_menu)
         return
 
     if data.startswith("cvt_"):
         to = data[4:]
-        st = get_state(user_id)
+        st = get_state(uid)
         frm = (st["data"] or {}).get("from") if st else None
         if not frm:
-            await q.edit_message_text("خطا. دوباره تلاش کن.", reply_markup=wallet_menu); return
-        set_state(user_id, "await_convert_amount", {"from": frm, "to": to})
+            await q.edit_message_text("خطا.", reply_markup=wallet_menu); return
+        set_state(uid, "await_convert_amount", {"from": frm, "to": to})
         await q.edit_message_text(
-            f"🔄 {CURRENCIES[frm]['name']} → {CURRENCIES[to]['name']}\n\n"
-            f"حداقل: {CURRENCIES[frm]['min_cv']}\nکارمزد: ۲٪\n\nمقدار را وارد کن:",
+            f"🔄 {CURRENCIES[frm]['name']} → {CURRENCIES[to]['name']}\nحداقل: {CURRENCIES[frm]['min_cv']}\nکارمزد: ۲٪\n\nمقدار:",
             reply_markup=wallet_menu)
         return
 
@@ -234,119 +248,104 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/start"):
         await start(update, context); return
 
-    # انتقال در گپ: Wallet 400 dogs
     m = re.match(r"Wallet\s+([\d.]+)\s+(\w+)", text, re.IGNORECASE)
     if m:
         if not update.message.reply_to_message:
-            await update.message.reply_text("❌ باید روی پیام کاربر مقصد ریپلای کنی."); return
+            await update.message.reply_text("❌ روی پیام کاربر ریپلای کن."); return
         amount = float(m.group(1)); cur = m.group(2).lower()
         if cur in ("dogs","doge"): cur = "dogez"
         if cur not in CURRENCIES:
-            await update.message.reply_text("❌ ارز نامعتبر. مثال: Wallet 400 dogs"); return
+            await update.message.reply_text("❌ ارز نامعتبر."); return
         to_user = update.message.reply_to_message.from_user
         if to_user.id == user.id:
-            await update.message.reply_text("❌ نمی‌تونی به خودت انتقال بدی."); return
+            await update.message.reply_text("❌ به خودت نمی‌تونی."); return
         from_db = get_user(user.id)
         if not from_db:
             await update.message.reply_text("❌ اول /start بزن."); return
         to_db = get_user(to_user.id)
         if not to_db:
-            ensure_user(to_user.id, to_user.username or ""); to_db = get_user(to_user.id)
+            ensure_user(to_user.id, to_user.username or "")
+            to_db = get_user(to_user.id)
         key = f"balance_{cur}"
         fb = float(from_db.get(key) or 0)
         if fb < amount:
-            await update.message.reply_text(f"❌ موجودی کافی نیست. موجودی: {fb} {CURRENCIES[cur]['name']}"); return
+            await update.message.reply_text(f"❌ موجودی: {fb}"); return
         query(f"update users set {key}=%s where telegram_id=%s", (fb-amount, user.id), fetch=False)
         query(f"update users set {key}=%s where telegram_id=%s", (float(to_db.get(key) or 0)+amount, to_user.id), fetch=False)
-        query("insert into transactions (telegram_id,type,currency,amount,status,extra) values (%s,%s,%s,%s,%s,%s)",
-              (user.id,"transfer",cur,amount,"approved",f"به {to_user.id}"), fetch=False)
-        query("insert into transactions (telegram_id,type,currency,amount,status,extra) values (%s,%s,%s,%s,%s,%s)",
-              (to_user.id,"transfer",cur,amount,"approved",f"از {user.id}"), fetch=False)
-        await update.message.reply_text(
-            f"✅ {amount} {CURRENCIES[cur]['name']} به {fmt_mention(to_user)} ارسال شد.",
-            parse_mode="Markdown")
-        await context.bot.send_message(
-            to_user.id,
-            f"💰 {amount} {CURRENCIES[cur]['name']} از طرف {fmt_mention(user)} دریافت کردی.",
-            parse_mode="Markdown")
+        await update.message.reply_text(f"✅ {amount} {CURRENCIES[cur]['name']} به {fmt_mention(to_user)} ارسال شد.", parse_mode="Markdown")
+        await context.bot.send_message(to_user.id, f"💰 {amount} {CURRENCIES[cur]['name']} از {fmt_mention(user)}", parse_mode="Markdown")
         return
 
     st = get_state(user.id)
     if not st: return
-    state = st["state"]
-    sd = st["data"] or {}
+    state = st["state"]; sd = st["data"] or {}
 
     if state == "await_deposit_amount":
         try: amt = float(text)
-        except: await update.message.reply_text("❌ عدد معتبر بفرست."); return
+        except: await update.message.reply_text("❌ عدد."); return
         cur = sd["currency"]; c = CURRENCIES[cur]
         if amt < c["min_dep"]:
-            await update.message.reply_text(f"❌ حداقل واریز {c['name']}: {c['min_dep']}"); return
+            await update.message.reply_text(f"❌ حداقل: {c['min_dep']}"); return
         set_state(user.id, "await_hash", {"currency": cur, "amount": amt})
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📤 ارسال هش", callback_data="send_hash")],
             [InlineKeyboardButton("❌ رد شدن", callback_data="reject_deposit")],
         ])
-        await update.message.reply_text(f"مقدار {amt} {c['name']} ثبت شد.\nهش تراکنش را بفرست:", reply_markup=kb)
-        return
+        await update.message.reply_text(f"مقدار {amt} {c['name']} ثبت شد.\nهش را بفرست:", reply_markup=kb); return
 
     if state == "await_hash":
         query("insert into transactions (telegram_id,type,currency,amount,tx_hash,status) values (%s,%s,%s,%s,%s,%s)",
               (user.id,"deposit",sd["currency"],sd["amount"],text,"pending"), fetch=False)
         clear_state(user.id)
-        await update.message.reply_text("✅ هش ثبت شد. در انتظار تایید مدیر.")
-        await context.bot.send_message(OWNER_ID,
-            f"🔔 واریز جدید\n👤 {user.id}\n💱 {sd['currency'].upper()}\n💰 {sd['amount']}\n🔗 {text}")
+        await update.message.reply_text("✅ ثبت شد. در انتظار تایید.")
+        await context.bot.send_message(OWNER_ID, f"🔔 واریز\n👤 {user.id}\n💱 {sd['currency'].upper()}\n💰 {sd['amount']}\n🔗 {text}")
         return
 
     if state == "await_withdraw_amount":
         try: amt = float(text)
-        except: await update.message.reply_text("❌ عدد معتبر بفرست."); return
+        except: await update.message.reply_text("❌ عدد."); return
         cur = sd["currency"]; c = CURRENCIES[cur]
         if amt < c["min_wd"]:
-            await update.message.reply_text(f"❌ حداقل برداشت {c['name']}: {c['min_wd']}"); return
+            await update.message.reply_text(f"❌ حداقل: {c['min_wd']}"); return
         set_state(user.id, "await_withdraw_address", {"currency": cur, "amount": amt})
-        prompt = "آدرس TRON خود را بفرست:" if cur=="tron" else ("تعداد STARS را بفرست:" if cur=="stars" else "آدرس TON خود را بفرست:")
-        await update.message.reply_text(prompt); return
+        await update.message.reply_text("آدرس ولت را بفرست:"); return
 
     if state == "await_withdraw_address":
         cur = sd["currency"]; amt = sd["amount"]; c = CURRENCIES[cur]
         u = get_user(user.id)
         if float(u.get(f"balance_{cur}") or 0) < amt:
-            clear_state(user.id); await update.message.reply_text("❌ موجودی کافی نیست."); return
+            clear_state(user.id); await update.message.reply_text("❌ موجودی کم."); return
         query("insert into transactions (telegram_id,type,currency,amount,fee,extra,status) values (%s,%s,%s,%s,%s,%s,%s)",
               (user.id,"withdraw",cur,amt,c["wd_fee"],text,"pending"), fetch=False)
         clear_state(user.id)
-        await update.message.reply_text("✅ درخواست برداشت ثبت شد. در انتظار تایید مدیر.")
-        await context.bot.send_message(OWNER_ID,
-            f"🔔 برداشت\n👤 {user.id}\n💱 {cur.upper()}\n💰 {amt}\n💸 کارمزد: {c['wd_fee']}\n📍 {text}")
+        await update.message.reply_text("✅ در انتظار تایید.")
+        await context.bot.send_message(OWNER_ID, f"🔔 برداشت\n👤 {user.id}\n💱 {cur.upper()}\n💰 {amt}\n💸 {c['wd_fee']}\n📍 {text}")
         return
 
     if state == "await_convert_amount":
         try: amt = float(text)
-        except: await update.message.reply_text("❌ عدد معتبر بفرست."); return
+        except: await update.message.reply_text("❌ عدد."); return
         frm = sd["from"]; to = sd["to"]; c = CURRENCIES[frm]
         if amt < c["min_cv"]:
-            await update.message.reply_text(f"❌ حداقل تبدیل {c['name']}: {c['min_cv']}"); return
+            await update.message.reply_text(f"❌ حداقل: {c['min_cv']}"); return
         u = get_user(user.id)
         if float(u.get(f"balance_{frm}") or 0) < amt:
-            clear_state(user.id); await update.message.reply_text("❌ موجودی کافی نیست."); return
+            clear_state(user.id); await update.message.reply_text("❌ موجودی کم."); return
         net = amt * 0.98
         query(f"update users set balance_{frm}=%s, balance_{to}=%s where telegram_id=%s",
               (float(u.get(f"balance_{frm}") or 0)-amt, float(u.get(f"balance_{to}") or 0)+net, user.id), fetch=False)
-        query("insert into transactions (telegram_id,type,currency,amount,fee,status) values (%s,%s,%s,%s,%s,%s)",
-              (user.id,"convert",f"{frm}->{to}",amt,amt*0.02,"approved"), fetch=False)
         clear_state(user.id)
-        await update.message.reply_text(
-            f"✅ {amt} {c['name']} → {net:.4f} {CURRENCIES[to]['name']}\nکارمزد ۲٪")
+        await update.message.reply_text(f"✅ {amt} {c['name']} → {net:.4f} {CURRENCIES[to]['name']}\nکارمزد ۲٪")
         return
 
 def main():
+    logger.info("Building application...")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    logger.info("Bot is starting polling...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
